@@ -16,6 +16,19 @@ from azure.cosmos.exceptions import CosmosHttpResponseError
 from src._credential import get_credential
 from src._utils import get_language_pretty_name, to_iso8601
 
+# Maps AICommentFeedbackReason enum values to human-readable messages.
+# Mirrors the C# ApiView structure (CommentFeedbackRequest.cs).
+FEEDBACK_REASON_MESSAGES = {
+    "FactuallyIncorrect": "This comment is factually incorrect.",
+    "RenderingBug": "This is a rendering bug in the associated language parser. Please open an issue to correct.",
+    "AcceptedRenderingChoice": ("This is how things are deliberately rendered in APIView. It is not a valid comment."),
+    "AcceptedSDKPattern": "This is a pattern we accept and encourage in our SDKs. DO NOT suggest otherwise.",
+    "OutdatedGuideline": (
+        "This is a valid comment for the guideline listed, but this guideline itself is out-of-date."
+        " Please open an issue."
+    ),
+}
+
 
 def get_version_type(version: Optional[str]) -> str:
     """
@@ -218,21 +231,24 @@ def get_active_reviews(
     *,
     environment: str = "production",
     omit_languages: Optional[list[str]] = None,
-) -> list[ActiveReviewMetadata]:
+    select_fields: Optional[list[str]] = None,
+) -> tuple[list[ActiveReviewMetadata], list[dict]]:
     """
     Lists distinct active APIView review IDs in the specified environment during the specified period.
-    The definition of "active" is any review that has comments created during the time period.
+    The definition of "active" is any review that has non-Diagnostic comments created during the time period.
     For each active review, also returns the active revisions (those with comments in the period)
     along with their package versions.
 
     Returns:
-        list[ActiveReviewMetadata] - list of metadata objects considered "active" during the query window,
-                                     including active revisions with package versions.
+        tuple of:
+            list[ActiveReviewMetadata] - metadata objects considered "active" during the query window.
+            list[dict] - raw comments (dicts) fetched from the Comments container.
     """
     metadata: list[ActiveReviewMetadata] = []
 
-    # Get comments in the date range
-    comments = get_comments_in_date_range(start_date, end_date, environment=environment)
+    # Get comments in the date range, excluding Diagnostic comments
+    raw_comments = get_comments_in_date_range(start_date, end_date, environment=environment, select_fields=select_fields)
+    comments = [c for c in raw_comments if c.get("CommentSource") != "Diagnostic"]
 
     # Extract unique review IDs and revision IDs from comments
     review_ids = set()
@@ -253,7 +269,7 @@ def get_active_reviews(
                 review_to_revisions[review_id].add(revision_id)
 
     if not review_ids:
-        return metadata
+        return metadata, raw_comments
 
     # Query Reviews container for review metadata
     reviews_container = get_apiview_cosmos_client(container_name="Reviews", environment=environment)
@@ -372,7 +388,7 @@ def get_active_reviews(
         omit_lower = {l.lower() for l in omit_languages}
         metadata = [r for r in metadata if r.language.lower() not in omit_lower]
 
-    return metadata
+    return metadata, raw_comments
 
 
 def get_active_review_ids(start_date: str, end_date: str, environment: str = "production") -> list:
@@ -398,17 +414,27 @@ def get_active_review_ids(start_date: str, end_date: str, environment: str = "pr
     return list(review_ids)
 
 
-def get_comments_in_date_range(start_date: str, end_date: str, environment: str = "production") -> list:
+def get_comments_in_date_range(
+    start_date: str, end_date: str, environment: str = "production", select_fields: Optional[list[str]] = None
+) -> list:
     """
     Retrieves all comments created within the specified date range in the given environment.
     Applies ISO8601 midnight/end-of-day formatting to start_date and end_date.
+
+    Args:
+        select_fields: Optional list of field names to select. If None, uses the default full field list.
     """
     start_iso = to_iso8601(start_date)
     end_iso = to_iso8601(end_date, end_of_day=True)
 
+    if select_fields:
+        select_clause = ", ".join(f"c.{f}" for f in select_fields)
+    else:
+        select_clause = ", ".join(APIVIEW_COMMENT_SELECT_FIELDS)
+
     comments_client = get_apiview_cosmos_client(container_name="Comments", environment=environment)
     result = comments_client.query_items(
-        query=f"SELECT {', '.join(APIVIEW_COMMENT_SELECT_FIELDS)} FROM c WHERE c.CreatedOn >= @start_date AND c.CreatedOn <= @end_date",
+        query=f"SELECT {select_clause} FROM c WHERE c.CreatedOn >= @start_date AND c.CreatedOn <= @end_date",
         parameters=[
             {"name": "@start_date", "value": start_iso},
             {"name": "@end_date", "value": end_iso},
@@ -449,7 +475,7 @@ def get_approvers(*, language: str = None, environment: str = "production") -> s
 
 
 def get_ai_comment_feedback(
-    language: str,
+    language: Optional[str],
     start_date: str,
     end_date: str,
     exclude: Optional[list[str]] = None,
@@ -467,7 +493,7 @@ def get_ai_comment_feedback(
     will not be returned.
 
     Args:
-        language: Language to filter by (e.g., 'python', 'java')
+        language: Language to filter by (e.g., 'python', 'java'). If None, returns all languages.
         start_date: Start date in YYYY-MM-DD format (filters by feedback submission time)
         end_date: End date in YYYY-MM-DD format (filters by feedback submission time)
         exclude: List of feedback types to exclude. Can include 'good', 'bad', 'delete'.
@@ -534,8 +560,8 @@ def get_ai_comment_feedback(
         )
         review_lang_map = {r["id"]: get_language_pretty_name(r.get("Language", "")) for r in review_results}
 
-    # Normalize target language
-    target_language = get_language_pretty_name(language).lower()
+    # Normalize target language (None means all languages)
+    target_language = get_language_pretty_name(language).lower() if language else None
 
     # Filter comments by language and feedback presence
     result = []
@@ -543,8 +569,11 @@ def get_ai_comment_feedback(
         # Check language
         review_id = comment.get("ReviewId", "")
         comment_language = review_lang_map.get(review_id, "").lower()
-        if comment_language != target_language:
+        if target_language and comment_language != target_language:
             continue
+
+        # Add language to each result for identification
+        comment["Language"] = review_lang_map.get(review_id, "")
 
         # Determine feedback type based on Upvotes, Downvotes, and IsDeleted
         upvotes = comment.get("Upvotes") or []
@@ -603,7 +632,7 @@ def resolve_package(
 
         Returns None if no matching package is found.
     """
-    from src._utils import run_prompty
+    from src._prompt_runner import run_prompt
 
     try:
         reviews_container = get_apiview_cosmos_client(container_name="Reviews", environment=environment)
@@ -643,7 +672,7 @@ def resolve_package(
 
             # Use LLM to find the best match
             try:
-                llm_result = run_prompty(
+                llm_result = run_prompt(
                     folder="other",
                     filename="resolve_package.prompty",
                     inputs={
@@ -742,4 +771,195 @@ def resolve_package(
         }
     except Exception as e:
         print(f"Error resolving package: {e}")
+        return None
+
+
+def _extract_code_for_element(full_text: str, element_id: Optional[str], context_lines: int = 5) -> Optional[str]:
+    """
+    Extract the code line matching the ElementId from the full APIView revision text,
+    plus surrounding context lines.
+
+    The APIView text has lines of the form "123: <code>" where 123 is a line number.
+    The ElementId is a semantic identifier (e.g.,
+    "com.azure.cosmos.models.QuantizerType.public-String-toString()") that encodes part
+    of the code on the line it's attached to.
+
+    If no match is found, falls back to the ElementId itself.
+
+    Args:
+        full_text: The full APIView revision text
+        element_id: The ElementId from the comment
+        context_lines: Number of lines of context to include before and after the matched line
+
+    Returns:
+        The extracted code snippet, or None if no text is available
+    """
+    if not full_text:
+        return None
+
+    if not element_id:
+        return None
+
+    lines = full_text.splitlines()
+
+    # Build search terms from the ElementId by extracting the meaningful parts.
+    # ElementIds look like:
+    #   "com.azure.cosmos.models.QuantizerType.public-String-toString()"
+    #   "maven-lineid-properties-com.azure:azure-json:1.5.1"
+    # We replace hyphens with spaces so that hyphen-separated tokens become
+    # individual search words, then score each APIView line by how many of
+    # those words it contains.  The line with the highest score wins.
+    search_parts = element_id.replace("-", " ").replace("(", " ").replace(")", " ")
+
+    best_idx = None
+    best_score = 0
+    search_words = [w.lower() for w in search_parts.split() if len(w) > 1]
+
+    for i, line in enumerate(lines):
+        # Strip the line number prefix if present (e.g., "123: ")
+        stripped = re.sub(r"^\d+:\s*", "", line).strip()
+        if not stripped:
+            continue
+
+        # Score: count how many words from the search_parts appear in the line
+        line_lower = stripped.lower()
+        score = sum(1 for w in search_words if w in line_lower)
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx is not None and best_score > 0:
+        start = max(0, best_idx - context_lines)
+        end = min(len(lines), best_idx + context_lines + 1)
+        return "\n".join(lines[start:end])
+
+    # Fallback: return the ElementId as-is for context
+    return element_id
+
+
+def get_comment_with_context(comment_id: str, environment: str = "production") -> Optional[dict]:
+    """
+    Retrieves a comment by its ID from the APIView database along with its related context
+    (language, package_name, code, feedback).
+
+    This is useful for processing feedback on AI-generated comments that were recorded
+    in the database but not acted upon.
+
+    Args:
+        comment_id: The unique identifier of the comment
+        environment: The APIView environment ('production' or 'staging')
+
+    Returns:
+        A dict containing:
+        - comment: The full comment object from the database
+        - language: The pretty language name (e.g., "Python")
+        - package_name: The package name from the review
+        - code: The API code from the revision (if available)
+        - feedback_text: A manufactured feedback message based on the Feedback entries
+
+        Returns None if the comment is not found.
+    """
+    try:
+        # Fetch the comment from the Comments container
+        comments_container = get_apiview_cosmos_client(container_name="Comments", environment=environment)
+
+        query = """
+            SELECT c.id, c.ReviewId, c.APIRevisionId, c.ElementId, c.ThreadId,
+                   c.CommentText, c.CorrelationId, c.ChangeHistory, c.IsResolved,
+                   c.Upvotes, c.Downvotes, c.TaggedUsers, c.CommentType, c.Severity,
+                   c.CommentSource, c.ResolutionLocked, c.CreatedBy, c.CreatedOn,
+                   c.IsDeleted, c.IsGeneric, c.GuidelineIds, c.MemoryIds,
+                   c.ConfidenceScore, c.Feedback
+            FROM c WHERE c.id = @comment_id
+        """
+        results = list(
+            comments_container.query_items(
+                query=query,
+                parameters=[{"name": "@comment_id", "value": comment_id}],
+                enable_cross_partition_query=True,
+            )
+        )
+
+        if not results:
+            return None
+
+        comment = results[0]
+        review_id = comment.get("ReviewId")
+        revision_id = comment.get("APIRevisionId")
+
+        # Get language and package name from Reviews container
+        language = None
+        package_name = None
+        if review_id:
+            reviews_container = get_apiview_cosmos_client(container_name="Reviews", environment=environment)
+            review_query = "SELECT c.Language, c.PackageName FROM c WHERE c.id = @review_id"
+            review_results = list(
+                reviews_container.query_items(
+                    query=review_query,
+                    parameters=[{"name": "@review_id", "value": review_id}],
+                    enable_cross_partition_query=True,
+                )
+            )
+            if review_results:
+                language = get_language_pretty_name(review_results[0].get("Language", ""))
+                package_name = review_results[0].get("PackageName", "")
+
+        # Get code from the revision - extract only the line matching the ElementId
+        code = None
+        element_id = comment.get("ElementId")
+        if revision_id:
+            try:
+                client = ApiViewClient(environment=environment)
+                full_text = asyncio.run(client.get_revision_text(revision_id=revision_id))
+                code = _extract_code_for_element(full_text, element_id)
+            except Exception as e:
+                print(f"Warning: Could not fetch revision content: {e}")
+                code = None
+
+        feedback_entries = comment.get("Feedback") or []
+        feedback_messages = []
+
+        for fb in feedback_entries:
+            fb_user = fb.get("SubmittedBy", "unknown")
+            reasons = fb.get("Reasons") or []
+            is_delete = fb.get("IsDelete", False)
+            fb_comment = (fb.get("Comment") or "").strip()
+
+            parts = []
+            # Map each reason to its human-readable message
+            for reason in reasons:
+                msg = FEEDBACK_REASON_MESSAGES.get(reason, reason)
+                parts.append(msg)
+
+            # Flag deletion
+            if is_delete:
+                parts.append(
+                    "This comment was flagged for deletion by the user, which means it was so egregiously bad"
+                    " that they didn't even want the service team to see it."
+                )
+
+            # Append additional comment text
+            if fb_comment:
+                parts.append(f"Additional feedback: {fb_comment}")
+
+            if parts:
+                feedback_text_block = (
+                    f"@azure-sdk user '{fb_user}' has provided the following feedback"
+                    f" on your previous comment:\n\n" + "\n".join(f"- {p}" for p in parts)
+                )
+                feedback_messages.append(feedback_text_block)
+
+        feedback_text = "\n\n".join(feedback_messages) if feedback_messages else "No feedback entries found."
+
+        return {
+            "comment": comment,
+            "language": language,
+            "package_name": package_name,
+            "code": code,
+            "feedback_text": feedback_text,
+        }
+
+    except Exception as e:
+        print(f"Error fetching comment with context: {e}")
         return None
